@@ -4,6 +4,7 @@
 enum class SparseFwdFeatures : int {
     HEAD_64,
     HEAD_128,
+    HEAD_DIM_576,
 
     ATTN_SINK,
     TOPK_LENGTH
@@ -19,6 +20,8 @@ class SparseFwdImplBase : public ImplBase<
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head64/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd/head128/phase1.h"
 #include "cuda_kernels/sm100/prefill/sparse/fwd_for_small_topk/head128/phase1.h"
+#include "cuda_kernels/sm100/prefill/sparse/fwd_d576/head64/phase1.h"
+#include "cuda_kernels/sm100/prefill/sparse/fwd_d576/head128/phase1.h"
 
 class SparseFwd_Sm100_Head64_Impl : public SparseFwdImplBase {
     DECLARE_SUPPORTED_FEATURES(
@@ -56,6 +59,36 @@ class SparseFwd_Sm100_Head128_Small_TopK_Impl : public SparseFwdImplBase {
 protected:
     void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
         sm100::prefill::sparse_fwd_for_small_topk::head128::run_sparse_fwd_for_small_topk_phase1_kernel<SparseAttnFwdMode::Prefill, ModelType::V41, ModelType::V41>(params);
+    }
+};
+
+// d_qk 576 (512 value channels and 64 RoPE channels) runs the nv_dev branch's kernels (b7643bd), unchanged apart from
+// their place in this tree, so that its results stay bit for bit those of nv_dev.
+class SparseFwd_Sm100_Head64_D576_Impl : public SparseFwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        SparseFwdFeatures::HEAD_64,
+        SparseFwdFeatures::HEAD_DIM_576,
+        SparseFwdFeatures::ATTN_SINK,
+        SparseFwdFeatures::TOPK_LENGTH
+    )
+
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        sm100::prefill::sparse_fwd_d576::head64::run_fwd_phase1_kernel<576>(params);
+    }
+};
+
+class SparseFwd_Sm100_Head128_D576_Impl : public SparseFwdImplBase {
+    DECLARE_SUPPORTED_FEATURES(
+        SparseFwdFeatures::HEAD_128,
+        SparseFwdFeatures::HEAD_DIM_576,
+        SparseFwdFeatures::ATTN_SINK,
+        SparseFwdFeatures::TOPK_LENGTH
+    )
+
+protected:
+    void run_(const SparseAttnFwdParams &params, const std::vector<FeatureT> &required_features) override {
+        sm100::prefill::sparse_fwd_d576::head128::run_fwd_phase1_kernel<576>(params);
     }
 };
 
@@ -117,7 +150,7 @@ static std::vector<Tensor> sparse_prefill_fwd(
     int topk = indices.size(2);
     bool have_topk_length = topk_length.has_value();
 
-    STD_TORCH_CHECK(d_qk == 512, "Invalid d_qk: ", d_qk);
+    STD_TORCH_CHECK(d_qk == 512 || d_qk == 576, "Invalid d_qk: ", d_qk);
     STD_TORCH_CHECK(d_v == 512, "Invalid d_v", d_v);
 
     KU_CHECK_DEVICE(q);
@@ -155,7 +188,9 @@ static std::vector<Tensor> sparse_prefill_fwd(
 
     SparseAttnFwdParams params = {
         s_q, s_kv, h_q, h_kv, d_qk, static_cast<int>(d_v), topk,
-        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
+        static_cast<float>(sm_scale),
+        // d_qk 576 rounds the scale to float before the product, as nv_dev does
+        d_qk == 576 ? static_cast<float>(sm_scale) * LOG_2_E : static_cast<float>(sm_scale * LOG_2_E),
 
         (bf16*)q.data_ptr(),
         (bf16*)kv.data_ptr(),
@@ -190,9 +225,20 @@ static std::vector<Tensor> sparse_prefill_fwd(
     if (have_topk_length) {
         required_features.push_back(SparseFwdFeatures::TOPK_LENGTH);
     }
+    if (d_qk == 576) {
+        required_features.push_back(SparseFwdFeatures::HEAD_DIM_576);
+    }
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
-    if (h_q == 64) {
+    if (d_qk == 576) {
+        if (h_q == 64) {
+            SparseFwd_Sm100_Head64_D576_Impl fwd_impl;
+            fwd_impl.run(params, required_features);
+        } else {
+            SparseFwd_Sm100_Head128_D576_Impl fwd_impl;
+            fwd_impl.run(params, required_features);
+        }
+    } else if (h_q == 64) {
         SparseFwd_Sm100_Head64_Impl fwd_impl;
         fwd_impl.run(params, required_features);
     } else {

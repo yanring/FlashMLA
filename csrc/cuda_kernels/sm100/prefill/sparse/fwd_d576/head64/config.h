@@ -3,9 +3,9 @@
 #include <cute/tensor.hpp>
 #include <kerutils/kerutils.cuh>
 
-#include "defines.h"
+#include "cuda_kernels/defines.h"
 
-namespace sm100::fwd::head64 {
+namespace sm100::prefill::sparse_fwd_d576::head64 {
 
 using namespace cute;
 

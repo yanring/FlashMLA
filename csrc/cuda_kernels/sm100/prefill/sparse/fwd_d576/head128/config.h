@@ -5,9 +5,9 @@
 #include <kerutils/kerutils.cuh>
 
 #include "params.h"
-#include "defines.h"
+#include "cuda_kernels/defines.h"
 
-namespace sm100::fwd::head128 {
+namespace sm100::prefill::sparse_fwd_d576::head128 {
 
 using namespace cute;
 

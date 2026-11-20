@@ -3,7 +3,7 @@
 #include <cute/tensor.hpp>
 #include <kerutils/kerutils.cuh>
 
-namespace sm100 {
+namespace sm100::prefill::sparse_fwd_d576 {
 
 /*
 Load K/V indices from global memory, and generate validity mask

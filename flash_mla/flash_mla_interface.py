@@ -195,7 +195,7 @@ def flash_mla_sparse_fwd(
     Sparse attention prefill kernel
 
     Args:
-        q: [s_q, h_q, d_qk], bfloat16. `d_qk` must be 512 and `h_q` must be 64 or 128.
+        q: [s_q, h_q, d_qk], bfloat16. `d_qk` must be 512 or 576 and `h_q` must be 64 or 128.
         kv: [s_kv, h_kv, d_qk], bfloat16
         indices: [s_q, h_kv, topk], int32. Invalid indices should be set to -1 or numbers >= s_kv
         sm_scale: float

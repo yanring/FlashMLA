@@ -9,12 +9,12 @@
 #include <cutlass/cuda_host_adapter.hpp>
 
 #include "params.h"
-#include "utils.h"
-#include "sm100/helpers.h"
+#include "cuda_kernels/utils.h"
+#include "cuda_kernels/sm100/helpers.h"
 
 #include "config.h"
 
-namespace sm100::fwd::head128 {
+namespace sm100::prefill::sparse_fwd_d576::head128 {
 
 using namespace cute;
 
