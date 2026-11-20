@@ -14,6 +14,7 @@ I/O: See SparseAttnFwdParams in csrc/params.h
 #include "phase1.h"
 
 #include <math_constants.h>
+#include <cuda_fp8.h>
 #include <cute/tensor.hpp>
 #include <cutlass/arch/reg_reconfig.h>
 #include <cutlass/arch/arch.h>
@@ -31,6 +32,30 @@ I/O: See SparseAttnFwdParams in csrc/params.h
 namespace sm100::prefill::sparse_fwd::head64 {
 
 using namespace cute;
+
+// Lemon's FP8 fake-quant of one block of 32 F32 values (BF16 values widened), bit for bit as its Triton kernel:
+// NaN-propagating amax, scale 2^ceil(log2(max(amax, 1e-4) * (1/448))) from exponent bits, multiply by the exact
+// reciprocal, clamp to +-448, E4M3 round-to-nearest-even, multiply back. No product is contracted.
+__forceinline__ __device__ float max_nan(float a, float b) {
+    return (a != a || b != b) ? __int_as_float(0x7fffffff) : fmaxf(a, b);
+}
+__forceinline__ __device__ float min_nan(float a, float b) {
+    return (a != a || b != b) ? __int_as_float(0x7fffffff) : fminf(a, b);
+}
+__forceinline__ __device__ void fp8_fake_quant_block32(float (&v)[32]) {
+    float amax = 0.0f;
+    CUTE_UNROLL
+    for (int i = 0; i < 32; ++i) amax = max_nan(amax, fabsf(v[i]));
+    const float t = __fmul_rn(max_nan(amax, 1e-4f), 1.0f / 448.0f);
+    const int bits = __float_as_int(t), biased = (bits >> 23) & 0xFF;
+    const int exponent = biased == 0xFF ? 0 : biased - 127 + ((bits & 0x7FFFFF) != 0);
+    const float scale = __int_as_float((exponent + 127) << 23), inverse = __int_as_float((127 - exponent) << 23);
+    CUTE_UNROLL
+    for (int i = 0; i < 32; ++i) {
+        const float scaled = min_nan(max_nan(__fmul_rn(v[i], inverse), -448.0f), 448.0f);
+        v[i] = __fmul_rn(float(__nv_fp8_e4m3(scaled)), scale);
+    }
+}
 
 /*
 Pipeline Overview:
@@ -381,16 +406,46 @@ KernelTemplate::sparse_attn_fwd_kernel_devfunc(const SparseAttnFwdParams &params
                     // NOTE. We neither signal any barrier after tmem_O is free, nor do we wait for any barrier in the UTCMMA warp, since the first O gemm in the next round depends on S, which depends on this warpgroup
 
                     // Convert and store
+                    nv_bfloat162 o_bf16[B_EPI/2];
+                    CUTE_UNROLL
+                    for (int i = 0; i < B_EPI/2; ++i) {
+                        o[i] = ku::float2_mul(o[i], output_scale_float2);
+                        o_bf16[i] = __float22bfloat162_rn(o[i]);
+                    }
+                    if (params.fake_quant_rope_cis != nullptr) {
+                        // Lemon: this thread's 64 columns of its head's row become their fake-quant; the trailing 64
+                        // (the RoPE dims) are one chunk.
+                        const int col0 = c*B_EPI_SB + (idx_in_warpgroup/MMA_M)*(B_EPI_SB/(128/MMA_M)) + k*B_EPI;
+                        static_assert(B_EPI == 64 && D_V % 64 == 0);
+                        CUTE_UNROLL
+                        for (int half = 0; half < 2; ++half) {
+                            float v[32];
+                            CUTE_UNROLL
+                            for (int p = 0; p < 16; ++p) {
+                                const float2 f = __bfloat1622float2(o_bf16[half*16 + p]);
+                                v[2*p] = f.x;
+                                v[2*p + 1] = f.y;
+                            }
+                            if (col0 == D_V - 64) {
+                                // conj rotation of (even, odd) pairs, as rotate(a, b, cos, -sin), rounded to BF16
+                                const float* cis = params.fake_quant_rope_cis + (int64_t)args.s_q_idx*64 + half*32;
+                                CUTE_UNROLL
+                                for (int p = 0; p < 16; ++p) {
+                                    const float cs = __ldg(cis + 2*p), sn = -__ldg(cis + 2*p + 1);
+                                    const float a = v[2*p], b = v[2*p + 1];
+                                    v[2*p] = __bfloat162float(__float2bfloat16_rn(__fmaf_rn(a, cs, -__fmul_rn(b, sn))));
+                                    v[2*p + 1] = __bfloat162float(__float2bfloat16_rn(__fmaf_rn(b, cs, __fmul_rn(a, sn))));
+                                }
+                            }
+                            fp8_fake_quant_block32(v);
+                            CUTE_UNROLL
+                            for (int p = 0; p < 16; ++p) o_bf16[half*16 + p] = __floats2bfloat162_rn(v[2*p], v[2*p + 1]);
+                        }
+                    }
                     CUTE_UNROLL
                     for (int i = 0; i < B_EPI/8; ++i) {
-                        nv_bfloat162 o_bf16[4];
-                        CUTE_UNROLL
-                        for (int j = 0; j < 4; ++j) {
-                            o[i*4+j] = ku::float2_mul(o[i*4+j], output_scale_float2);
-                            o_bf16[j] = __float22bfloat162_rn(o[i*4+j]);
-                        }
                         bf16* sO_ptr = sO_addrs[i] + (c*B_EPI_SB + (idx_in_warpgroup/MMA_M)*(B_EPI_SB/(128/MMA_M)) + k*B_EPI)*MMA_M;
-                        ku::st_shared(sO_ptr, *(__int128_t*)(o_bf16));
+                        ku::st_shared(sO_ptr, *(__int128_t*)(o_bf16 + i*4));
                     }
     
                     // Sync

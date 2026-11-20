@@ -154,6 +154,7 @@ std::vector<Tensor> fused_norm_rope_attn_rope_cast_fwd(
         SparseAttnFwdMode::Prefill,
         arch.num_sms,
         get_current_stream(),
+        nullptr,    // fake_quant_rope_cis: Lemon's fake-quant output is not used here
 
         enable_q_norm,
         static_cast<float>(rms_norm_eps),

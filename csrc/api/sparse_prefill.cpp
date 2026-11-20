@@ -268,8 +268,85 @@ static std::vector<Tensor> sparse_prefill_fwd(
 }
 
 #ifdef FLASH_MLA_IS_BUILD_ON_CUDA
+// Lemon: the 64-head, d_qk 512 sparse prefill whose output is FP8-fake-quant(inverse-RoPE(attention output)) in BF16
+// (see SparseAttnFwdParams::fake_quant_rope_cis). Returns {out_fq, max_logits, lse}.
+static std::vector<Tensor> sparse_prefill_fwd_fq(
+    const Tensor &q,
+    const Tensor &kv,
+    const Tensor &indices,
+    double sm_scale,
+    int64_t d_v,
+    const std::optional<Tensor> &attn_sink,
+    const std::optional<Tensor> &topk_length,
+    const Tensor &rope_cis
+) {
+    Arch arch = Arch();
+    STD_TORCH_CHECK(arch.is_sm100f(), "sparse_prefill_fwd_fq runs on SM100f only");
+    KU_CHECK_NDIM(q, 3);
+    KU_CHECK_NDIM(kv, 3);
+    KU_CHECK_NDIM(indices, 3);
+    KU_CHECK_NDIM(attn_sink, 1);
+    KU_CHECK_NDIM(topk_length, 1);
+    KU_CHECK_NDIM(rope_cis, 2);
+    int s_q = q.size(0), s_kv = kv.size(0), h_q = q.size(1), h_kv = kv.size(1), d_qk = q.size(2);
+    int topk = indices.size(2);
+    STD_TORCH_CHECK(h_q == 64 && d_qk == 512 && d_v == 512, "sparse_prefill_fwd_fq takes 64 heads and d_qk = d_v = 512");
+    KU_CHECK_DEVICE(q);
+    KU_CHECK_DEVICE(kv);
+    KU_CHECK_DEVICE(indices);
+    KU_CHECK_DEVICE(attn_sink);
+    KU_CHECK_DEVICE(topk_length);
+    KU_CHECK_DEVICE(rope_cis);
+    KU_CHECK_DTYPE(q, ScalarType::BFloat16);
+    KU_CHECK_DTYPE(kv, ScalarType::BFloat16);
+    KU_CHECK_DTYPE(indices, ScalarType::Int);
+    KU_CHECK_DTYPE(attn_sink, ScalarType::Float);
+    KU_CHECK_DTYPE(topk_length, ScalarType::Int);
+    KU_CHECK_DTYPE(rope_cis, ScalarType::Float);
+    KU_CHECK_SHAPE(q, s_q, h_q, d_qk);
+    KU_CHECK_SHAPE(kv, s_kv, h_kv, d_qk);
+    KU_CHECK_SHAPE(indices, s_q, h_kv, topk);
+    KU_CHECK_SHAPE(attn_sink, h_q);
+    KU_CHECK_SHAPE(topk_length, s_q);
+    KU_CHECK_SHAPE(rope_cis, s_q, 64);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(q);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(kv);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(indices);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(attn_sink);
+    KU_CHECK_LAST_DIM_CONTIGUOUS(topk_length);
+    KU_CHECK_CONTIGUOUS(rope_cis);
+
+    torch::stable::accelerator::DeviceGuard device_guard(q.get_device_index());
+    Tensor out_fq = torch::stable::new_empty(q, {s_q, h_q, d_v});
+    Tensor max_logits = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
+    Tensor lse = torch::stable::new_empty(q, {s_q, h_q}, ScalarType::Float);
+
+    SparseAttnFwdParams params = {
+        s_q, s_kv, h_q, h_kv, d_qk, static_cast<int>(d_v), topk,
+        static_cast<float>(sm_scale), static_cast<float>(sm_scale * LOG_2_E),
+        (bf16*)q.data_ptr(),
+        (bf16*)kv.data_ptr(),
+        (int*)indices.data_ptr(),
+        ku::get_optional_tensor_ptr<float>(attn_sink),
+        ku::get_optional_tensor_ptr<int>(topk_length),
+        int64_stride_to_int(q.stride(0)), int64_stride_to_int(q.stride(1)),
+        int64_stride_to_int(kv.stride(0)), int64_stride_to_int(kv.stride(1)),
+        int64_stride_to_int(indices.stride(0)), int64_stride_to_int(indices.stride(1)),
+        (bf16*)out_fq.data_ptr(),
+        (float*)max_logits.data_ptr(),
+        (float*)lse.data_ptr(),
+        SparseAttnFwdMode::Prefill,
+        get_num_sms(),
+        get_current_stream(),
+        (const float*)rope_cis.data_ptr(),
+    };
+    sm100::prefill::sparse_fwd::head64::run_sparse_fwd_phase1_kernel(params);
+    return {out_fq, max_logits, lse};
+}
+
 STABLE_TORCH_LIBRARY_IMPL(flash_mla, CUDA, m) {
     m.impl("sparse_prefill_fwd", TORCH_BOX(&sparse_prefill_fwd));
+    m.impl("sparse_prefill_fwd_fq", TORCH_BOX(&sparse_prefill_fwd_fq));
 }
 #endif
 

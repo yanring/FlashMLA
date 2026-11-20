@@ -220,6 +220,26 @@ def flash_mla_sparse_fwd(
     return results
 
 
+def flash_mla_sparse_fwd_fq(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    sm_scale: float,
+    rope_cis: torch.Tensor,
+    attn_sink: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    `flash_mla_sparse_fwd` for 64 heads and d_qk = d_v = 512 whose output is out_fq, the FP8 fake-quant (E4M3 per 32,
+    power-of-two scale) of the BF16 attention output with its trailing 64 dims rotated by conj(rope_cis) and rounded
+    to BF16, in BF16. rope_cis: [s_q, 64] float32, (cos, sin) pairs of each query token's 32 frequencies.
+
+    Returns:
+        (out_fq, max_logits, lse)
+    """
+    return _backend.sparse_prefill_fwd_fq(q, kv, indices, sm_scale, 512, attn_sink, topk_length, rope_cis)
+
+
 def _require_dense_backend(op: str, symbol: str) -> None:
     """
     The dense bindings are registered on the CUDA backend only, so on Ascend they are missing from

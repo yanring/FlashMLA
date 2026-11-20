@@ -76,6 +76,12 @@ struct SparseAttnFwdParams {
     SparseAttnFwdMode mode;     // Which forward mode to use (Prefill / Decode / DecodeWithSplitKV)
     int num_sm;                 // Number of SMs available for this kernel launch
     stream_t stream;
+
+    // Optional, h_q = 64 and d_qk = 512 prefill only (Lemon). When set, `out` holds FP8-fake-quant(inverse-RoPE(
+    // attention output)) in BF16 instead of the attention output, bit for bit as Lemon's rope_fp8_fake_quant: the
+    // BF16 output's trailing 64 dims rotated by conj(rope_cis[s_q_idx]) (F32, rounded to BF16), then E4M3 per 32 with
+    // scale 2^ceil(log2(max(amax, 1e-4) / 448)). rope_cis: [s_q, 32] complex64 as F32 (cos, sin) pairs.
+    FLASH_MLA_GM const float* __restrict__ fake_quant_rope_cis = nullptr;
 };
 
 // Tile scheduling metadata for split-KV decoding. Each entry describes
